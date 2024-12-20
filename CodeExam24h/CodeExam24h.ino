@@ -1,7 +1,9 @@
-#include <RTClib.h>
 #include <WiFi.h>
 #include <FirebaseClient.h>
 #include <WiFiClientSecure.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h> // Thư viện Mutex
 
 #define BUTTON_PIN 15
 #define LED_STATE_PIN 5
@@ -17,7 +19,6 @@
 #define WIFI_SSID "KuTin"
 #define WIFI_PWD "Nhathung0933713845"
 
-RTC_DS3231 rtc;
 WiFiClientSecure ssl;
 DefaultNetwork network;
 AsyncClientClass client(ssl, getNetwork(network));
@@ -27,11 +28,18 @@ RealtimeDatabase Database;
 AsyncResult result;
 LegacyToken dbSecret(FIREBASE_AUTH);
 
-hw_timer_t* timer = NULL; 
-// portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED; 
+TaskHandle_t FirebaseTaskHandle = NULL;
+SemaphoreHandle_t stateMutex; // Mutex bảo vệ truy cập biến
 
+hw_timer_t* timer = NULL; 
+portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED; 
+
+volatile int scheduledStart = 0;
+volatile int scheduledEnd = 0;
+
+volatile bool manualModeState = true;  // false: OFF Manual Mode) | true: ON Manual Mode
+volatile bool autoModeState = false;   // false: OFF Automation Mode) | true: ON Automation Mode
 bool configState = false;     // false: Device Config | true: WiFi Config
-bool modeState = false;       // false: OFF Manual Mode (Automations) | true: ON Manual Mode
 bool output1State = false;    // false: OFF Output_1 | true: ON Output_1
 bool output2State = false;    // false: OFF Output_2 | true: ON Output_2
 
@@ -43,32 +51,87 @@ unsigned long lastPressTime = 0;
 uint8_t lastButtonState = 0;
 uint8_t pressCounter = 0;
 
-uint8_t timeON = 0;
+uint8_t timeONFlag = 0;
+uint8_t timeONSecond = 0;
+uint8_t intervalFlag = 0;
+uint8_t intervalMinute = 0; 
+uint8_t intervalSecond = 0;
 
 void IRAM_ATTR onTimer()
 {   
   //...Into mode ISR 
-  // portENTER_CRITICAL_ISR(&timerMux);
+  portENTER_CRITICAL_ISR(&timerMux);
 
-  static uint8_t sec = 0;
-
-  if (timeON == 1)
+  if (timeONFlag == 1)
   {
-    sec++;
-    Serial.print("Thời gian ON: "); Serial.println(sec);
+    timeONSecond++;
+    Serial.print("Thời gian ON: "); Serial.print(timeONSecond); Serial.println(" giây");
 
-    if (sec == 45)
+    if (timeONSecond == 45)
     {
-      digitalWrite(LED_OUTPUT1_PIN, LOW);
+      // Hẹn sau 5 phút 15 giây sẽ lặp lại
+      intervalFlag = 1;
 
       // Reset giá trị
-      timeON = 0;
-      sec = 0;
+      timeONFlag = 0;
+      timeONSecond = 0;
+    }
+  }
+
+  if (intervalFlag == 1)
+  {
+    digitalWrite(LED_OUTPUT1_PIN, LOW);
+
+    Serial.print("Thời gian lặp lại: "); Serial.print(intervalMinute); Serial.print(" phút "); Serial.print(intervalSecond); Serial.println(" giây");
+    intervalSecond++; 
+
+    if (intervalSecond > 59)
+    {
+      intervalMinute++;
+
+      // Reset giá trị
+      intervalSecond = 0;
+    }
+
+    if (intervalMinute == 5 && intervalSecond == 15)
+    {
+      timeONFlag = 1;
+      digitalWrite(LED_OUTPUT1_PIN, HIGH);
+
+      // Reset giá trị
+      intervalMinute = 0;
+      intervalSecond = 0;
+      intervalFlag = 0;
     }
   }
   
   //...Exit mode ISR 
-  // portEXIT_CRITICAL_ISR(&timerMux); 
+  portEXIT_CRITICAL_ISR(&timerMux); 
+}
+
+void FirebaseTask(void *pvParameters)
+{
+  unsigned long lastTime = 0; 
+
+  while (true)
+  {
+    unsigned long currentTime = millis();
+    if (currentTime - lastTime > 500)
+    {
+      scheduledStart = Database.get<int>(client, "/App/06Hour00Minute/start");
+      scheduledEnd = Database.get<int>(client, "/App/00Hour59Minute/end");
+
+      // Serial.print("Giờ bắt đầu: "); Serial.println(getHourStart);
+      // Serial.print("Phút bắt đầu: "); Serial.println(getMinuteStart);
+      // Serial.print("Giờ kết thúc: "); Serial.println(getHourEnd);
+      // Serial.print("Phút kết thúc: "); Serial.println(getMinuteEnd);
+
+      lastTime = currentTime;
+    }
+
+    // Delay before next update
+    vTaskDelay(pdMS_TO_TICKS(500)); // 500 millisecond
+  }
 }
 
 void setup() 
@@ -85,13 +148,6 @@ void setup()
   timerAttachInterrupt(timer, onTimer); // Gắn hàm xử lý ngắt
   timerAlarm(timer, 1000000, true, 0); // Báo ngắt mỗi 1s (1000000 ticks), không đặt lại bộ đếm
   timerStart(timer); // Bắt đầu Timer
-
-  if (! rtc.begin())
-  {
-    Serial.println("Couldn't find RTC");
-    Serial.flush();
-    while (1) delay(10);
-  }
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PWD);
@@ -116,6 +172,11 @@ void setup()
 
   // In sync functions, we have to set the operating result for the client that works with the function.
   client.setAsyncResult(result);
+
+  manualModeState = Database.get<bool>(client, "/App/control/manualMode");
+  autoModeState = Database.get<bool>(client, "/App/control/autoMode");
+
+  xTaskCreatePinnedToCore(FirebaseTask, "FirebaseTask", 8192, NULL, 1, &FirebaseTaskHandle, 0);
 }
 
 void loop()
@@ -140,7 +201,7 @@ void loop()
 
     // Lưu giá trị
     lastPressTime = millis();
-    isPressed = !isPressed;
+    isPressed = false;
   }
   else if (isPressed && buttonState == HIGH && millis() - lastPressTime > PRESS_TIME_THRESHOLD)
   {
@@ -150,104 +211,142 @@ void loop()
     if (currentPressTime - lastPressTime >= LONG_TIME)
     {
       isHolding = !isHolding;
+      pressCounter = 0;
 
       // Lưu giá trị
       lastPressTime = currentPressTime;
-      isPressed = !isPressed;
+      isPressed = false;
     }
   }
   else if (isPressed && buttonState == LOW && millis() - lastPressTime > PRESS_TIME_THRESHOLD)
   {
     // Lưu giá trị
     lastPressTime = currentPressTime;
-    isPressed = !isPressed;
+    isPressed = false;
   }
 
-  if (isHolding && buttonState == LOW)
+  if (autoModeState)
   {
-    // Reset số lần nhấn
-    pressCounter = 0;
-
-    configState =! configState;
-    if (configState)
+    if (scheduledStart)
     {
-      Serial.println("WiFi Config");
-      digitalWrite(LED_STATE_PIN, HIGH);
-    }
-    else
-    {
-      Serial.println("Device Config");
-      digitalWrite(LED_STATE_PIN, LOW);
-    }
-
-    isHolding = !isHolding;
-  }
-
-  if (millis() - lastPressTime > 500 && pressCounter > 0)
-  {
-    switch(pressCounter)
-    {
-    case 1:
-      output1State = !output1State;
-      if (output1State)
+      if (timeONSecond < 45 && intervalFlag == 0)
       {
-        Serial.println("ON Output 1");
+        timeONFlag = 1;
         digitalWrite(LED_OUTPUT1_PIN, HIGH);
       }
-      else
+    }
+
+    if (scheduledEnd)
+    {
+      timeONFlag = 0;
+      timeONSecond = 0;
+      intervalFlag = 0;
+      intervalMinute = 0; 
+      intervalSecond = 0;
+      
+      digitalWrite(LED_OUTPUT1_PIN, LOW);
+    }
+
+    if (millis() - lastPressTime > 500 && pressCounter > 0)
+    {
+      switch(pressCounter)
       {
-        Serial.println("OFF Output 1");
+      case 3:
+        Serial.println("Manual Mode");
+        
         digitalWrite(LED_OUTPUT1_PIN, LOW);
-      }
-      break;
 
-    case 2:
-      output2State = !output2State;
-      if (output2State)
+        autoModeState = false;
+        manualModeState = true;
+        Database.set<bool>(client, "/App/control/autoMode", autoModeState);
+        Database.set<bool>(client, "/App/control/manualMode", manualModeState);
+
+        timeONFlag = 0;
+        timeONSecond = 0;
+        intervalFlag = 0;
+        intervalMinute = 0; 
+        intervalSecond = 0;
+        break;
+      }
+
+      // Reset số lần nhấn
+      pressCounter = 0;
+    }
+  }
+  
+  if (manualModeState)
+  {
+    if (isHolding && buttonState == LOW)
+    {
+      // Reset số lần nhấn
+      pressCounter = 0;
+
+      configState =! configState;
+      if (configState)
       {
-        Serial.println("ON Output 2");
-        digitalWrite(LED_OUTPUT2_PIN, HIGH);
+        Serial.println("WiFi Config");
+        digitalWrite(LED_STATE_PIN, HIGH);
       }
       else
       {
-        Serial.println("OFF Output 2");
-        digitalWrite(LED_OUTPUT2_PIN, LOW);
+        Serial.println("Device Config");
+        digitalWrite(LED_STATE_PIN, LOW);
       }
-      break;
 
-    case 3:
-      modeState = !modeState; 
-      Database.set<bool>(client, "/App/control/autoMode", modeState);
-      break;
+      isHolding = !isHolding;
     }
-
-    // Reset số lần nhấn
-    pressCounter = 0;
-  } 
-
-  if (Database.get<bool>(client, "/App/control/autoMode"))
-  {
-    DateTime now = rtc.now();
-    Serial.print(now.hour(), DEC);
-    Serial.print(':');
-    Serial.print(now.minute(), DEC);
-    Serial.print(':');
-    Serial.println(now.second(), DEC);
-
-    uint8_t __minute = now.minute() + 2; // Do là giây lệch với đồng hồ thực tế đến 35s
-    if (Database.get<int>(client, "/App/setStartTime/setHour") == now.hour() && Database.get<int>(client, "/App/setStartTime/setMinute") == __minute)
+    
+    if (millis() - lastPressTime > 500 && pressCounter > 0)
     {
-      if (timeON < 45)
+      switch(pressCounter)
       {
-        timeON = 1;
-        digitalWrite(LED_OUTPUT1_PIN, HIGH);
+      case 1:
+        output1State = !output1State;
+        if (output1State)
+        {
+          Serial.println("ON Output 1");
+          digitalWrite(LED_OUTPUT1_PIN, HIGH);
+        }
+        else
+        {
+          Serial.println("OFF Output 1");
+          digitalWrite(LED_OUTPUT1_PIN, LOW);
+        }
+        break;
+
+      case 2:
+        output2State = !output2State;
+        if (output2State)
+        {
+          Serial.println("ON Output 2");
+          digitalWrite(LED_OUTPUT2_PIN, HIGH);
+        }
+        else
+        {
+          Serial.println("OFF Output 2");
+          digitalWrite(LED_OUTPUT2_PIN, LOW);
+        }
+        break;
+
+      case 3:
+        Serial.println("Automation Mode");
+
+        autoModeState = true; 
+        manualModeState = false;
+        Database.set<bool>(client, "/App/control/autoMode", autoModeState);
+        Database.set<bool>(client, "/App/control/manualMode", manualModeState);
+
+        timeONFlag = 0;
+        timeONSecond = 0;
+        intervalFlag = 0;
+        intervalMinute = 0; 
+        intervalSecond = 0;
+        break;
       }
+
+      // Reset số lần nhấn
+      pressCounter = 0;
     }
-  }
-  else
-  {
-    Serial.println("Manual Mode");
-    digitalWrite(2, LOW);
   }
 
   // Lưu trạng thái nút nhấn
